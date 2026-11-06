@@ -1,0 +1,454 @@
+# =============================================================================
+# deploy.yaml — Entrega continua de main (DevSecOps + GitOps)
+# -----------------------------------------------------------------------------
+#  push a main ─► gates (reutilizables: Gitleaks, Semgrep, SonarQube, tests, IaC)
+#              ─► build (Trivy gate, SBOM, DAST ZAP, push GHCR tag = SHA, attestations SLSA)
+#              ─► gitops-promote (commit de image.tag + image.digest en values.yaml)
+#              ─► gitops-e2e (kind + ArgoCD efímeros: Synced/Healthy, smoke y self-heal)
+#              ─► render-deploy (Deploy Hook del commit EXACTO + verificación de /version)
+#
+# Los Pull Requests siguen su propio ciclo en preview.yaml (entorno efímero en AWS).
+# Principios: zero-trust (permissions mínimos por job), acciones e imágenes fijadas por
+# SHA/digest (supply chain), "build once, deploy many" (se despliega el digest escaneado)
+# y GitOps (el pipeline NO tiene credenciales del clúster: solo escribe en Git).
+# =============================================================================
+name: deploy
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+  workflow_dispatch:
+
+# Zero-trust: el GITHUB_TOKEN no tiene permisos por defecto; cada job pide solo lo suyo.
+permissions: {}
+
+# Un despliegue a la vez: nunca se cancela una ejecución a medias sobre main.
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  # Nombre de la imagen = nombre del servicio (no del repositorio): ghcr.io/<owner>/devsecops-api
+  IMAGE_NAME: devsecops-api
+  CHART_PATH: charts/devsecops-api
+  NODE_VERSION: "24"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. Gates de seguridad (workflow reutilizable compartido con preview.yaml)
+  # ---------------------------------------------------------------------------
+  gates:
+    name: Security gates
+    uses: ./.github/workflows/_security-gates.yaml
+    permissions:
+      contents: read
+      security-events: write # SARIF de Semgrep, Checkov y zizmor
+
+  # ---------------------------------------------------------------------------
+  # 2. Build → Trivy (gate) → SBOM → DAST → publicación inmutable + attestations
+  #    La imagen solo llega al registro si superó TODOS los controles.
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build, escaneo y publicación
+    needs: gates
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write # publicar en GHCR con el GITHUB_TOKEN (sin secretos de larga vida)
+      id-token: write # OIDC -> firma keyless (Sigstore) de las attestations
+      attestations: write # guardar attestations de procedencia SLSA y SBOM
+      security-events: write # SARIF de Trivy
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Referencia de imagen (tag = commit SHA)
+        id: meta
+        run: |
+          image="${REGISTRY}/${GITHUB_REPOSITORY_OWNER,,}/${IMAGE_NAME}"   # OCI exige minúsculas
+          {
+            echo "image=${image}"
+            echo "ref=${image}:${GITHUB_SHA}"
+            echo "build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: docker build (multi-stage, distroless, metadatos de trazabilidad)
+        env:
+          IMAGE_REF: ${{ steps.meta.outputs.ref }}
+          BUILD_DATE: ${{ steps.meta.outputs.build_date }}
+        run: |
+          docker build app \
+            --tag "$IMAGE_REF" \
+            --build-arg GIT_SHA="$GITHUB_SHA" \
+            --build-arg BUILD_DATE="$BUILD_DATE" \
+            --build-arg BUILD_RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            --build-arg IMAGE_REF="$IMAGE_REF" \
+            --build-arg GIT_REPOSITORY="$GITHUB_REPOSITORY"
+
+      - name: Trivy - reporte completo (SARIF a Code Scanning)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ steps.meta.outputs.ref }}
+          scanners: vuln,secret
+          format: sarif
+          output: trivy-image.sarif
+          exit-code: "0"
+          version: v0.76.2
+
+      - name: Trivy - GATE (bloquea CRITICAL/HIGH con parche disponible)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ steps.meta.outputs.ref }}
+          scanners: vuln,secret
+          format: table
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+          version: v0.76.2
+          skip-setup-trivy: true
+
+      - name: SBOM CycloneDX (inventario de componentes de la imagen)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ steps.meta.outputs.ref }}
+          format: cyclonedx
+          output: sbom.cdx.json
+          version: v0.76.2
+          skip-setup-trivy: true
+
+      - name: Arrancar el contenedor con el mismo endurecimiento que en Kubernetes
+        env:
+          IMAGE_REF: ${{ steps.meta.outputs.ref }}
+        run: |
+          docker run -d --name app -p 8080:8080 \
+            --read-only --tmpfs /tmp:size=16m \
+            --cap-drop ALL --security-opt no-new-privileges \
+            --memory 128m --pids-limit 64 \
+            "$IMAGE_REF"
+          for _ in $(seq 1 30); do
+            curl -fsS http://localhost:8080/healthz && exit 0
+            sleep 1
+          done
+          docker logs app
+          exit 1
+
+      - name: DAST - OWASP ZAP baseline
+        uses: zaproxy/action-baseline@de8ad967d3548d44ef623df22cf95c3b0baf8b25 # v0.15.0
+        with:
+          target: http://localhost:8080
+          docker_name: ghcr.io/zaproxy/zaproxy:stable@sha256:9624669db72f54d86c4b46a7064518bd9bf79d8c61a4c31befa9923489f328af
+          rules_file_name: .zap/rules.tsv
+          # -I: los WARN se reportan sin bloquear; solo bloquean las reglas marcadas FAIL en rules.tsv.
+          cmd_options: -I
+          allow_issue_writing: false
+          fail_action: true
+          artifact_name: zap-report
+
+      - name: Detener contenedor de prueba
+        if: ${{ always() }}
+        run: docker rm -f app || true
+
+      - name: Login en GHCR (GITHUB_TOKEN efímero)
+        if: ${{ github.event_name != 'pull_request' }}
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "$GHCR_TOKEN" | docker login "$REGISTRY" -u "$GITHUB_ACTOR" --password-stdin
+
+      - name: Publicar imagen y obtener digest inmutable
+        id: push
+        if: ${{ github.event_name != 'pull_request' }}
+        env:
+          IMAGE_REF: ${{ steps.meta.outputs.ref }}
+        run: |
+          docker push "$IMAGE_REF"
+          digest="$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE_REF" | cut -d@ -f2)"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          echo "Publicada ${IMAGE_REF}@${digest}"
+
+      - name: Attestation de procedencia SLSA (firmada con Sigstore vía OIDC)
+        if: ${{ github.event_name != 'pull_request' }}
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ steps.meta.outputs.image }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+      - name: Attestation del SBOM
+        if: ${{ github.event_name != 'pull_request' }}
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-name: ${{ steps.meta.outputs.image }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          sbom-path: sbom.cdx.json
+          push-to-registry: true
+
+      - name: Publicar SARIF de Trivy
+        if: ${{ !cancelled() && github.event_name != 'pull_request' }}
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          sarif_file: trivy-image.sarif
+          category: trivy-image
+
+      - name: Guardar evidencias (SBOM + SARIF)
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: security-evidence
+          path: |
+            sbom.cdx.json
+            trivy-image.sarif
+          retention-days: 30
+
+      - name: Resumen
+        if: ${{ github.event_name != 'pull_request' }}
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          {
+            echo "### Imagen publicada"
+            echo ""
+            echo "| Campo | Valor |"
+            echo "|---|---|"
+            echo "| Imagen | \`${IMAGE}:${GITHUB_SHA}\` |"
+            echo "| Digest | \`${DIGEST}\` |"
+            echo ""
+            echo "Verificar procedencia:"
+            echo '```bash'
+            echo "gh attestation verify oci://${IMAGE}@${DIGEST} --repo ${GITHUB_REPOSITORY}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # 3. GitOps: el pipeline NO despliega; declara el nuevo estado deseado en Git
+  # ---------------------------------------------------------------------------
+  gitops-promote:
+    name: GitOps - actualizar values.yaml
+    needs: build
+    if: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write # único job con permiso de escritura en el repositorio
+    concurrency:
+      group: gitops-promote
+      cancel-in-progress: false
+    outputs:
+      commit: ${{ steps.commit.outputs.sha }}
+    steps:
+      - name: Checkout de main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          persist-credentials: true # zizmor: ignore[artipacked] necesario para el git push del bot
+
+      - name: Actualizar image.tag e image.digest
+        env:
+          IMAGE: ${{ needs.build.outputs.image }}
+          DIGEST: ${{ needs.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          [[ "$DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]] || { echo "Digest inválido: $DIGEST"; exit 1; }
+          export TAG="$GITHUB_SHA"
+          yq -i '.image.repository = strenv(IMAGE) | .image.tag = strenv(TAG) | .image.digest = strenv(DIGEST)' \
+            "$CHART_PATH/values.yaml"
+          git --no-pager diff
+
+      - name: Commit y push (rebase + reintentos ante carreras)
+        id: commit
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet; then
+            echo "values.yaml ya apunta a esta imagen; nada que promover."
+          else
+            git add "$CHART_PATH/values.yaml"
+            git commit -m "chore(gitops): promover devsecops-api a ${GITHUB_SHA::7} [skip ci]" \
+              -m "Imagen construida, escaneada y firmada en ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            for attempt in 1 2 3 4 5; do
+              git pull --rebase origin main && git push origin HEAD:main && break
+              echo "Push rechazado (intento ${attempt}); reintentando..."
+              sleep $((attempt * 3))
+            done
+          fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # 4. Verificación de punta a punta: ArgoCD real en un clúster efímero
+  #    Prueba que el commit GitOps es desplegable y que ArgoCD corrige el drift.
+  # ---------------------------------------------------------------------------
+  gitops-e2e:
+    name: Verificación GitOps (kind + ArgoCD)
+    needs: [build, gitops-promote]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: read # descargar la imagen privada de GHCR desde el clúster
+    env:
+      ARGOCD_VERSION: v3.6.1
+      ARGOCD_COMMIT: 94037c4d4e1af4bd0651d37a179fbd9e347e668c # commit del tag v3.6.1 (inmutable)
+      APP: devsecops-api-dev
+      NS: devsecops-dev
+      REVISION: ${{ needs.gitops-promote.outputs.commit }}
+    steps:
+      - name: Checkout del commit promovido
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.gitops-promote.outputs.commit }}
+          persist-credentials: false
+
+      - name: Clúster Kubernetes efímero (kind)
+        uses: helm/kind-action@ea822c7bf1874f08e5a491df991c228edffc3376 # v1.15.2
+        with:
+          cluster_name: gitops-e2e
+
+      - name: Instalar ArgoCD (core, manifiesto fijado por commit)
+        run: |
+          set -euo pipefail
+          kubectl create namespace argocd
+          kubectl apply -n argocd --server-side --force-conflicts \
+            -f "https://raw.githubusercontent.com/argoproj/argo-cd/${ARGOCD_COMMIT}/manifests/core-install.yaml"
+          kubectl -n argocd wait --for=condition=Available deployment --all --timeout=300s
+          kubectl -n argocd rollout status statefulset/argocd-application-controller --timeout=300s
+
+      - name: Namespace con Pod Security "restricted" y credencial de pull
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          kubectl create namespace "$NS"
+          kubectl label namespace "$NS" \
+            pod-security.kubernetes.io/enforce=restricted pod-security.kubernetes.io/warn=restricted
+          auth="$(printf '%s:%s' "$GITHUB_ACTOR" "$GHCR_TOKEN" | base64 -w0)"
+          printf '{"auths":{"ghcr.io":{"auth":"%s"}}}' "$auth" \
+            | kubectl -n "$NS" create secret generic ghcr-pull \
+                --type=kubernetes.io/dockerconfigjson --from-file=.dockerconfigjson=/dev/stdin
+
+      - name: Registrar AppProject y Application (apuntando al commit promovido)
+        run: |
+          set -euo pipefail
+          kubectl apply -f gitops/argocd/appproject.yaml
+          yq '.spec.source.targetRevision = strenv(REVISION)
+              | .spec.source.helm.valuesObject.imagePullSecrets = [{"name": "ghcr-pull"}]' \
+            gitops/argocd/application-dev.yaml | tee /dev/stderr | kubectl apply -f -
+
+      - name: Esperar Synced + Healthy
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 60); do
+            sync="$(kubectl -n argocd get application "$APP" -o jsonpath='{.status.sync.status}')"
+            health="$(kubectl -n argocd get application "$APP" -o jsonpath='{.status.health.status}')"
+            rev="$(kubectl -n argocd get application "$APP" -o jsonpath='{.status.sync.revision}')"
+            echo "[$i] sync=${sync:-?} health=${health:-?} revision=${rev:0:7}"
+            if [ "$sync" = "Synced" ] && [ "$health" = "Healthy" ] && [ "$rev" = "$REVISION" ]; then
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "ArgoCD no alcanzó Synced/Healthy en 5 minutos"
+          exit 1
+
+      - name: Smoke test - el pod sirve exactamente el commit construido
+        run: |
+          set -euo pipefail
+          image="$(kubectl -n "$NS" get deploy devsecops-api -o jsonpath='{.spec.template.spec.containers[0].image}')"
+          echo "Imagen desplegada: $image"
+          [[ "$image" == *":${GITHUB_SHA}@sha256:"* ]] || { echo "La imagen no está fijada por tag+digest"; exit 1; }
+          kubectl -n "$NS" port-forward svc/devsecops-api 18080:80 > /tmp/port-forward.log 2>&1 &
+          for _ in $(seq 1 20); do curl -fsS http://127.0.0.1:18080/healthz && break; sleep 1; done
+          served="$(curl -fsS http://127.0.0.1:18080/version | jq -r .commit)"
+          echo "Commit servido: $served"
+          [ "$served" = "$GITHUB_SHA" ]
+
+      - name: Drift - un cambio manual en el clúster es revertido por ArgoCD (selfHeal)
+        run: |
+          set -euo pipefail
+          desired="$(kubectl -n "$NS" get deploy devsecops-api -o jsonpath='{.spec.replicas}')"
+          echo "Réplicas declaradas en Git: $desired. Simulando 'kubectl scale' manual a 3..."
+          kubectl -n "$NS" scale deployment devsecops-api --replicas=3
+          for i in $(seq 1 36); do
+            current="$(kubectl -n "$NS" get deploy devsecops-api -o jsonpath='{.spec.replicas}')"
+            echo "[$i] réplicas=$current"
+            if [ "$current" = "$desired" ]; then
+              echo "ArgoCD revirtió el drift: el clúster vuelve al estado declarado en Git."
+              exit 0
+            fi
+            sleep 5
+          done
+          exit 1
+
+      - name: Diagnóstico (runbook CrashLoopBackOff automatizado)
+        if: ${{ failure() }}
+        run: |
+          kubectl -n argocd get application "$APP" -o yaml || true
+          kubectl get pods -A -o wide || true
+          kubectl -n "$NS" describe pods || true
+          kubectl -n "$NS" logs deploy/devsecops-api --all-containers --previous --tail=100 || true
+          kubectl -n "$NS" logs deploy/devsecops-api --all-containers --tail=100 || true
+          kubectl get events -A --sort-by=.lastTimestamp | tail -60 || true
+          kubectl -n argocd logs statefulset/argocd-application-controller --tail=80 || true
+          kubectl -n argocd logs deployment/argocd-repo-server --tail=80 || true
+
+      - name: Resumen
+        run: |
+          {
+            echo "### Verificación GitOps"
+            echo ""
+            echo "- ArgoCD ${ARGOCD_VERSION} sincronizó \`${APP}\` al commit \`${REVISION:0:7}\`: **Synced / Healthy**"
+            echo "- El pod sirve el commit \`${GITHUB_SHA:0:7}\` con imagen fijada por digest"
+            echo "- Drift manual (\`kubectl scale\`) revertido automáticamente por \`selfHeal\`"
+            echo "- Namespace con Pod Security Admission \`restricted\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # 5. Entorno público (Render): despliega el commit EXACTO que pasó todo lo
+  #    anterior y verifica que la URL pública sirve ese SHA.
+  # ---------------------------------------------------------------------------
+  render-deploy:
+    name: Render - desplegar y verificar el commit
+    needs: gitops-e2e
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions: {}
+    env:
+      RENDER_URL: ${{ vars.RENDER_URL || 'https://devsecops-gitops-challenge.onrender.com' }}
+    steps:
+      - name: Disparar Deploy Hook (ref = commit verificado)
+        id: hook
+        env:
+          RENDER_DEPLOY_HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+        run: |
+          if [ -z "$RENDER_DEPLOY_HOOK_URL" ]; then
+            echo "::notice::Secreto RENDER_DEPLOY_HOOK_URL no configurado: se omite el despliegue en Render."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          curl -fsS -X POST -o /dev/null "${RENDER_DEPLOY_HOOK_URL}&ref=${GITHUB_SHA}"
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+
+      - name: Verificar que Render sirve el commit desplegado
+        if: ${{ steps.hook.outputs.enabled == 'true' }}
+        run: |
+          for i in $(seq 1 60); do
+            served="$(curl -fsS --max-time 20 "${RENDER_URL}/version" 2>/dev/null | jq -r .commit || true)"
+            echo "[$i] Render sirve: ${served:-sin respuesta}"
+            if [ "$served" = "$GITHUB_SHA" ]; then
+              echo "### Render actualizado: [${RENDER_URL}](${RENDER_URL}) sirve \`${GITHUB_SHA:0:7}\`" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "Render no sirvió ${GITHUB_SHA} en 10 minutos"
+          exit 1

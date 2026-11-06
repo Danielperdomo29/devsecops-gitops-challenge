@@ -1,0 +1,98 @@
+# =============================================================================
+# promote-prod.yaml — Promoción controlada a PRODUCCIÓN (GitOps + four-eyes)
+# -----------------------------------------------------------------------------
+# 1. Recibe el SHA de un commit ya construido por deploy.yaml.
+# 2. Resuelve el digest de la imagen en GHCR.
+# 3. Verifica la attestation SLSA: la imagen DEBE haber sido construida por el
+#    workflow deploy.yaml de ESTE repositorio (no se promueve nada de origen dudoso).
+# 4. Abre un Pull Request que fija image.tag e image.digest en el override de prod.
+#    Un humano revisa y aprueba; al hacer merge, ArgoCD sincroniza producción.
+# =============================================================================
+name: promote-prod
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: SHA completo (40 caracteres) del commit cuya imagen se promueve
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: promote-prod
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  # Nombre de la imagen = nombre del servicio (no del repositorio): ghcr.io/<owner>/devsecops-api
+  IMAGE_NAME: devsecops-api
+  OVERRIDE_FILE: gitops/environments/prod/values.override.yaml
+
+jobs:
+  promote:
+    name: Abrir PR de promoción a prod
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write # crear la rama de promoción
+      pull-requests: write # abrir el PR
+      packages: read # leer el manifiesto de la imagen
+      attestations: read # verificar la procedencia SLSA
+    steps:
+      - name: Validar input
+        env:
+          SHA: ${{ inputs.commit_sha }}
+        run: |
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "commit_sha debe ser un SHA de 40 caracteres hex"; exit 1; }
+
+      - name: Checkout de main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          persist-credentials: true # zizmor: ignore[artipacked] necesario para publicar la rama de promoción
+
+      - name: Resolver digest y verificar procedencia SLSA
+        id: verify
+        env:
+          SHA: ${{ inputs.commit_sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          image="${REGISTRY}/${GITHUB_REPOSITORY_OWNER,,}/${IMAGE_NAME}"
+          echo "$GH_TOKEN" | docker login "$REGISTRY" -u "$GITHUB_ACTOR" --password-stdin
+          digest="$(docker buildx imagetools inspect "${image}:${SHA}" --format '{{json .Manifest}}' | jq -r .digest)"
+          [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]] || { echo "No se encontró la imagen ${image}:${SHA}"; exit 1; }
+          gh attestation verify "oci://${image}@${digest}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/deploy.yaml"
+          {
+            echo "image=${image}"
+            echo "digest=${digest}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Crear rama y Pull Request
+        env:
+          SHA: ${{ inputs.commit_sha }}
+          IMAGE: ${{ steps.verify.outputs.image }}
+          DIGEST: ${{ steps.verify.outputs.digest }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          branch="promote/prod-${SHA::7}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          export TAG="$SHA"
+          yq -i '.image.repository = strenv(IMAGE) | .image.tag = strenv(TAG) | .image.digest = strenv(DIGEST) | .image.pullPolicy = "Always"' \
+            "$OVERRIDE_FILE"
+          git add "$OVERRIDE_FILE"
+          git commit -m "release(prod): promover devsecops-api a ${SHA::7}"
+          git push origin "$branch"
+          # shellcheck disable=SC2016 # las comillas invertidas son Markdown, no sustitución de comandos
+          body="$(printf 'Promoción a **producción** de la imagen `%s:%s`.\n\n- Digest: `%s`\n- Procedencia SLSA verificada contra `deploy.yaml` de este repositorio.\n\nAl hacer merge, ArgoCD sincroniza `devsecops-api-prod`.' "$IMAGE" "$SHA" "$DIGEST")"
+          if ! gh pr create --base main --head "$branch" \
+                 --title "release(prod): promover devsecops-api a ${SHA::7}" --body "$body"; then
+            echo "::warning::No se pudo abrir el PR automáticamente. Ábrelo aquí: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/compare/main...${branch}"
+          fi
