@@ -1,0 +1,28 @@
+# Configuración de Checkov (policy-as-code). Cada excepción está justificada:
+# una excepción sin motivo documentado es deuda de seguridad oculta.
+# Las excepciones de Terraform van EN LÍNEA (#checkov:skip=...) junto al recurso afectado,
+# para que la justificación viaje con el código que la necesita.
+directory:
+  - rendered            # manifiestos generados con `helm template` por entorno
+  - app                 # Dockerfile
+  - .github/workflows   # workflows de GitHub Actions
+  - infra               # Terraform: bootstrap + entorno efímero de AWS
+framework:
+  - kubernetes
+  - dockerfile
+  - github_actions
+  - terraform
+skip-path:
+  - node_modules
+  - .terraform
+compact: true
+quiet: true
+skip-check:
+  # CKV_GHA_7: promote-prod.yaml recibe el SHA como input de workflow_dispatch. No construye
+  # artefactos: valida el input con regex y verifica la attestation SLSA antes de usarlo.
+  - CKV_GHA_7
+soft-fail-on:
+  # CKV_K8S_43 (imagen por digest): el digest solo existe DESPUÉS del build y lo escribe el job
+  # gitops-promote en values.yaml. Se reporta (no bloquea) para no fallar el primer bootstrap;
+  # a partir de la primera promoción el render siempre incluye repo:tag@sha256:...
+  - CKV_K8S_43

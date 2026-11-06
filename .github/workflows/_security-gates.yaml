@@ -1,0 +1,289 @@
+# =============================================================================
+# _security-gates.yaml — Gates de seguridad REUTILIZABLES (workflow_call)
+# -----------------------------------------------------------------------------
+# Una sola definición de los controles, usada por:
+#   - preview.yaml  (cada Pull Request)
+#   - deploy.yaml   (cada push a main)
+# DRY: si se endurece un control, se endurece en todos los flujos a la vez.
+# =============================================================================
+name: security-gates
+
+on:
+  workflow_call:
+
+permissions: {}
+
+env:
+  NODE_VERSION: "24"
+  TF_VERSION: "1.17.1"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Secret scanning sobre TODO el historial de Git
+  # ---------------------------------------------------------------------------
+  secrets-scan:
+    name: Secret scanning (Gitleaks)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    # jobs.<id>.container: todos los pasos corren DENTRO de esta imagen (fijada por digest).
+    container:
+      image: zricethezav/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f
+    steps:
+      - name: Checkout (historial completo)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Gitleaks sobre todos los commits
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          gitleaks git --redact --verbose --exit-code 1 .
+
+  # ---------------------------------------------------------------------------
+  # SAST — análisis estático con reglas de seguridad
+  # ---------------------------------------------------------------------------
+  sast:
+    name: SAST (Semgrep)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write # publicar hallazgos en GitHub Code Scanning
+    container:
+      image: semgrep/semgrep:1.184.0@sha256:cc1b68266f267878b39739373ea9985b9a78e5d64497dd875c8de100b22695ed
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Semgrep (OWASP Top 10, Node.js, Dockerfile, Kubernetes, Terraform, GitHub Actions)
+        run: >-
+          semgrep scan
+          --config p/javascript --config p/nodejs --config p/owasp-top-ten
+          --config p/dockerfile --config p/kubernetes --config p/terraform --config p/github-actions
+          --metrics off --error
+          --sarif-output semgrep.sarif
+
+      - name: Publicar SARIF en Code Scanning
+        if: ${{ !cancelled() && github.event_name != 'pull_request' }}
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+
+  # ---------------------------------------------------------------------------
+  # SonarQube EFÍMERO: servidor levantado dentro del job y destruido al terminar.
+  # Sin cuentas externas ni tokens de larga vida; quality gate definido como código.
+  # ---------------------------------------------------------------------------
+  sonarqube:
+    name: SonarQube (quality gate)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    services:
+      sonarqube:
+        image: sonarqube:26.11.0.134175-community@sha256:1ce197471f5f2bac347694a336862fd2c23e9f57c6edb46acebbfbe70f2c7d9c
+        ports:
+          - 9000:9000
+        env:
+          SONAR_ES_BOOTSTRAP_CHECKS_DISABLE: "true"
+    env:
+      SONAR_URL: http://localhost:9000
+      SCANNER_IMAGE: sonarsource/sonar-scanner-cli:12.3.1.4302_8.3.1@sha256:38207bba3d98c8ce6f6c051ea2b9f05a24480da78c9ee5945ceafc3d9de02b88
+    steps:
+      - name: Checkout (historial completo para blame y código nuevo)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          package-manager-cache: false
+
+      - name: Pruebas con cobertura LCOV
+        working-directory: app
+        run: |
+          npm ci --ignore-scripts
+          npm run test:lcov
+          # Rutas relativas a la raíz del repo (app/src/...) para que el escáner en contenedor las resuelva.
+          sed -i -E "s#^SF:(${GITHUB_WORKSPACE}/)?(app/)?#SF:app/#" lcov.info
+
+      - name: Preparar SonarQube efímero (credenciales aleatorias + quality gate como código)
+        id: sonar
+        run: bash scripts/sonarqube-bootstrap.sh
+
+      - name: Análisis + espera del quality gate
+        env:
+          SONAR_TOKEN: ${{ steps.sonar.outputs.token }}
+        run: >-
+          docker run --rm --network host -e SONAR_HOST_URL="$SONAR_URL" -e SONAR_TOKEN
+          -v "$GITHUB_WORKSPACE:/usr/src" "$SCANNER_IMAGE"
+          -Dsonar.qualitygate.wait=true -Dsonar.qualitygate.timeout=300
+
+      - name: Resumen de métricas
+        if: ${{ !cancelled() }}
+        env:
+          SONAR_TOKEN: ${{ steps.sonar.outputs.token }}
+        run: bash scripts/sonarqube-summary.sh >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # Calidad: lint + pruebas unitarias con umbral de cobertura obligatorio
+  # ---------------------------------------------------------------------------
+  test:
+    name: Lint y pruebas
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          package-manager-cache: false
+
+      - name: Instalar dependencias (lockfile estricto, sin scripts)
+        run: npm ci --ignore-scripts
+
+      - name: SCA de dependencias npm
+        run: npm audit --audit-level=high
+
+      - name: Lint y formato (Biome)
+        run: npm run lint
+
+      - name: Pruebas + cobertura (líneas >= 90 %)
+        run: npm test
+
+  # ---------------------------------------------------------------------------
+  # IaC y políticas: Helm, Kubernetes, Terraform, Dockerfile y workflows
+  # ---------------------------------------------------------------------------
+  iac-scan:
+    name: IaC y políticas
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write # publicar SARIF de Checkov y zizmor en Code Scanning
+    env:
+      CHART_PATH: charts/devsecops-api
+      HELM_VERSION: v4.3.1
+      HELM_SHA256: 0403a88ae20913d11b10a2467b50087721fea7581736da6b9d3992f5357fe54b
+      KUBECONFORM_VERSION: v0.8.0
+      KUBECONFORM_SHA256: 9bc2bffbf71f261128533edaf912153948b7ff238f9a531ae6d34466ec287883
+      CHECKOV_IMAGE: bridgecrew/checkov:3.4.3@sha256:bfe9d70bb7f044aba49bd99675813445f106dee6072da583f51008cb667f3a63
+      HADOLINT_IMAGE: hadolint/hadolint:v2.15.1@sha256:32dac94127fd60b7b7e3fbfc65e1383b9b5e25c9bfd7b8536de7a539fe68a12d
+      ACTIONLINT_IMAGE: rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
+      ZIZMOR_IMAGE: ghcr.io/zizmorcore/zizmor:1.32.0@sha256:3014cc8f68f663935f69b3c3e0e41f5ce102b268d97db13db0f62208747f860d
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Instalar Helm y kubeconform (versiones fijadas + verificación SHA-256)
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl -fsSL --proto '=https' --tlsv1.2 -o /tmp/helm.tgz "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz"
+          echo "${HELM_SHA256}  /tmp/helm.tgz" | sha256sum -c -
+          tar -xzf /tmp/helm.tgz -C /tmp && mv /tmp/linux-amd64/helm "$RUNNER_TEMP/bin/"
+          curl -fsSL --proto '=https' --tlsv1.2 -o /tmp/kc.tgz "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz"
+          echo "${KUBECONFORM_SHA256}  /tmp/kc.tgz" | sha256sum -c -
+          tar -xzf /tmp/kc.tgz -C "$RUNNER_TEMP/bin" kubeconform
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform fmt + validate (bootstrap y preview)
+        run: |
+          set -euo pipefail
+          terraform fmt -check -recursive -diff infra
+          for dir in infra/bootstrap infra/preview; do
+            terraform -chdir="$dir" init -backend=false -input=false >/dev/null
+            terraform -chdir="$dir" validate
+          done
+
+      - name: helm lint (por entorno, con values.schema.json)
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          for env in dev prod; do
+            helm lint "$CHART_PATH" --strict -f "gitops/environments/${env}/values.override.yaml"
+          done
+
+      - name: Renderizar manifiestos por entorno
+        run: |
+          set -euo pipefail
+          mkdir -p rendered
+          for env in dev prod; do
+            helm template devsecops-api "$CHART_PATH" --namespace "devsecops-${env}" \
+              -f "gitops/environments/${env}/values.override.yaml" > "rendered/${env}.yaml"
+          done
+
+      # Route (OpenShift) es una API agregada, no un CRD: no tiene esquema en el catálogo.
+      # Se omite aquí y se valida con `oc apply --dry-run=server` contra el clúster OpenShift.
+      - name: kubeconform (esquemas de Kubernetes y CRDs de ArgoCD)
+        run: >-
+          kubeconform -strict -summary -output pretty -skip Route
+          -schema-location default
+          -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
+          rendered/ gitops/argocd/
+
+      # Los gates siguientes corren aunque falle uno anterior (!cancelled) para reportar TODO
+      # en una sola ejecución; el job falla igualmente si cualquiera de ellos falla.
+      - name: Hadolint (buenas prácticas de Dockerfile)
+        if: ${{ !cancelled() }}
+        run: docker run --rm -i "$HADOLINT_IMAGE" < app/Dockerfile
+
+      - name: actionlint (sintaxis y shellcheck de workflows)
+        if: ${{ !cancelled() }}
+        run: docker run --rm -v "$PWD:/repo" -w /repo "$ACTIONLINT_IMAGE" -color
+
+      - name: Checkov (Kubernetes, Terraform, Dockerfile y GitHub Actions)
+        if: ${{ !cancelled() }}
+        run: >-
+          docker run --rm -v "$PWD:/repo" -w /repo "$CHECKOV_IMAGE"
+          --config-file .checkov.yaml
+          --output cli --output sarif --output-file-path console,checkov.sarif
+
+      - name: zizmor (seguridad de la cadena de CI/CD)
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          docker run --rm -e GH_TOKEN -v "$PWD:/repo" -w /repo "$ZIZMOR_IMAGE" .github/
+          docker run --rm -e GH_TOKEN -v "$PWD:/repo" -w /repo "$ZIZMOR_IMAGE" --format sarif .github/ > zizmor.sarif || true
+
+      - name: Publicar SARIF de Checkov
+        if: ${{ !cancelled() && github.event_name != 'pull_request' && hashFiles('checkov.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          sarif_file: checkov.sarif
+          category: checkov
+
+      - name: Publicar SARIF de zizmor
+        if: ${{ !cancelled() && github.event_name != 'pull_request' && hashFiles('zizmor.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          sarif_file: zizmor.sarif
+          category: zizmor
