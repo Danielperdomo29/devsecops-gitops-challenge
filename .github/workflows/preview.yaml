@@ -1,0 +1,523 @@
+# =============================================================================
+# preview.yaml — Ciclo de vida DevSecOps + FinOps de cada Pull Request
+# -----------------------------------------------------------------------------
+#  PR abierto / nuevo commit
+#    1 · Security gates ........ Gitleaks, Semgrep, SonarQube, tests, Checkov, Trivy (reutilizable)
+#    2 · Build y escaneo ....... imagen distroless, Trivy (gate), SBOM, push GHCR, attestations SLSA
+#    3 · Validación artefacto .. procedencia firmada, SBOM firmado, no-root, sin shell, tamaño
+#    4 · Terraform apply ....... VPC aislada + ECS Fargate Spot en AWS (OIDC, sin llaves)
+#    5 · Integración ........... pruebas contra el entorno real (acceso just-in-time /32)
+#    6 · DAST .................. OWASP ZAP full scan (activo) contra el entorno efímero
+#    7 · Reporte ............... comentario en el PR: seguridad + costo estimado + URL + TTL
+#  PR mergeado o cerrado
+#    8 · Terraform destroy ..... elimina TODA la infraestructura y el estado del PR
+#    9 · Limpieza .............. borra las imágenes del PR del registro
+#
+# Si AWS aún no está configurado (vars.AWS_ROLE_ARN vacío), 5 y 6 corren contra el
+# contenedor local: el PR NUNCA queda sin pruebas de integración ni DAST.
+# =============================================================================
+name: preview
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, closed]
+
+permissions: {}
+
+# Nunca se cancela a mitad un apply/destroy: el estado de Terraform debe quedar consistente.
+concurrency:
+  group: preview-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  # Nombre de la imagen = nombre del servicio (no del repositorio): ghcr.io/<owner>/devsecops-api
+  IMAGE_NAME: devsecops-api
+  PR_NUMBER: ${{ github.event.pull_request.number }}
+  HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  TF_VERSION: "1.17.1"
+  TF_DIR: infra/preview
+
+jobs:
+  # ---------------------------------------------------------------------------
+  gates:
+    name: "1 · Security gates"
+    if: ${{ github.event.action != 'closed' }}
+    uses: ./.github/workflows/_security-gates.yaml
+    permissions:
+      contents: read
+      security-events: write # SARIF de los escáneres
+
+  # ---------------------------------------------------------------------------
+  build:
+    name: "2 · Build y escaneo de la imagen"
+    needs: gates
+    # PRs de forks y de Dependabot: GitHub les da un token de solo lectura y sin OIDC.
+    # Pasan los security gates, pero no construyen, despliegan ni comentan.
+    if: ${{ github.event.action != 'closed' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write # publicar la imagen del PR en GHCR
+      id-token: write # firma keyless (Sigstore) de las attestations
+      attestations: write # procedencia SLSA y SBOM
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+      tag: ${{ steps.meta.outputs.tag }}
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - name: Checkout del commit del PR
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Referencia de imagen (tag = pr-<N>-<commit>)
+        id: meta
+        run: |
+          image="${REGISTRY}/${GITHUB_REPOSITORY_OWNER,,}/${IMAGE_NAME}"
+          tag="pr-${PR_NUMBER}-${HEAD_SHA}"
+          {
+            echo "image=${image}"
+            echo "tag=${tag}"
+            echo "ref=${image}:${tag}"
+            echo "build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: docker build
+        env:
+          IMAGE_REF: ${{ steps.meta.outputs.ref }}
+          BUILD_DATE: ${{ steps.meta.outputs.build_date }}
+        run: |
+          docker build app \
+            --tag "$IMAGE_REF" \
+            --build-arg GIT_SHA="$HEAD_SHA" \
+            --build-arg BUILD_DATE="$BUILD_DATE" \
+            --build-arg BUILD_RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            --build-arg IMAGE_REF="$IMAGE_REF" \
+            --build-arg GIT_REPOSITORY="$GITHUB_REPOSITORY"
+
+      - name: Trivy - GATE (bloquea CRITICAL/HIGH con parche disponible)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ steps.meta.outputs.ref }}
+          scanners: vuln,secret
+          format: table
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+          version: v0.76.2
+
+      - name: SBOM CycloneDX
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ steps.meta.outputs.ref }}
+          format: cyclonedx
+          output: sbom.cdx.json
+          version: v0.76.2
+          skip-setup-trivy: true
+
+      - name: Publicar en GHCR y obtener digest inmutable
+        id: push
+        env:
+          IMAGE_REF: ${{ steps.meta.outputs.ref }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$GHCR_TOKEN" | docker login "$REGISTRY" -u "$GITHUB_ACTOR" --password-stdin
+          docker push "$IMAGE_REF"
+          digest="$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE_REF" | cut -d@ -f2)"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+
+      - name: Attestation de procedencia SLSA
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ steps.meta.outputs.image }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+      - name: Attestation del SBOM
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-name: ${{ steps.meta.outputs.image }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          sbom-path: sbom.cdx.json
+          push-to-registry: true
+
+  # ---------------------------------------------------------------------------
+  verify:
+    name: "3 · Validación del artefacto"
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      attestations: read # verificar procedencia y SBOM
+      packages: read # descargar la imagen
+    env:
+      IMAGE: ${{ needs.build.outputs.image }}
+      DIGEST: ${{ needs.build.outputs.digest }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Procedencia SLSA firmada por ESTE workflow de ESTE repositorio
+        run: |
+          gh attestation verify "oci://${IMAGE}@${DIGEST}" --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/preview.yaml"
+
+      - name: SBOM firmado adjunto a la imagen
+        run: |
+          gh attestation verify "oci://${IMAGE}@${DIGEST}" --repo "$GITHUB_REPOSITORY" \
+            --predicate-type https://cyclonedx.org/bom
+
+      - name: Políticas de la imagen (no root, trazabilidad, sin shell, presupuesto de tamaño)
+        run: |
+          set -euo pipefail
+          ref="${IMAGE}@${DIGEST}"
+          docker pull -q "$ref"
+          user="$(docker image inspect --format '{{.Config.User}}' "$ref")"
+          rev="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$ref")"
+          size_mb="$(( $(docker image inspect --format '{{.Size}}' "$ref") / 1024 / 1024 ))"
+          echo "usuario=${user} revision=${rev:0:7} tamaño=${size_mb}MB"
+          [ "$user" = "65532:65532" ] || { echo "La imagen no corre como 65532 (no root)"; exit 1; }
+          [ "$rev" = "$HEAD_SHA" ]   || { echo "La etiqueta de revisión no coincide con el commit del PR"; exit 1; }
+          [ "$size_mb" -le 250 ]     || { echo "Imagen de ${size_mb}MB supera el presupuesto de 250MB"; exit 1; }
+          if docker run --rm --entrypoint /bin/sh "$ref" -c true 2>/dev/null; then
+            echo "La imagen contiene una shell (debe ser distroless)"; exit 1
+          fi
+          {
+            echo "### Artefacto validado"
+            echo "- Procedencia SLSA y SBOM firmados: verificados"
+            echo "- Usuario \`${user}\` · revisión \`${rev:0:7}\` · ${size_mb} MB · sin shell"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  infra:
+    name: "4 · Terraform apply (AWS efímero)"
+    needs: [build, verify]
+    if: ${{ vars.AWS_ROLE_ARN != '' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    environment:
+      name: preview
+      url: ${{ steps.endpoint.outputs.url }}
+    permissions:
+      contents: read
+      id-token: write # OIDC -> rol temporal de AWS (sin access keys)
+    outputs:
+      url: ${{ steps.endpoint.outputs.url }}
+      security_group_id: ${{ steps.endpoint.outputs.security_group_id }}
+      hourly_usd: ${{ steps.endpoint.outputs.hourly_usd }}
+      monthly_usd: ${{ steps.endpoint.outputs.monthly_usd }}
+      expires_at: ${{ steps.endpoint.outputs.expires_at }}
+    env:
+      TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+      TF_VAR_pr_number: ${{ github.event.pull_request.number }}
+      TF_VAR_image: ${{ needs.build.outputs.image }}@${{ needs.build.outputs.digest }}
+      TF_VAR_execution_role_arn: ${{ vars.ECS_EXECUTION_ROLE_ARN }}
+      TF_VAR_commit_sha: ${{ github.event.pull_request.head.sha }}
+      TF_VAR_owner: ${{ github.event.pull_request.user.login }}
+      TF_VAR_region: ${{ vars.AWS_REGION || 'us-east-1' }}
+      TF_VAR_allowed_cidrs: ${{ vars.PREVIEW_ALLOWED_CIDRS || '[]' }}
+    steps:
+      - name: Checkout del commit del PR (la infraestructura del PR también se prueba)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Credenciales temporales de AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          role-session-name: gha-pr-${{ github.event.pull_request.number }}-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-duration-seconds: 3600
+
+      - name: Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: terraform init (estado aislado por PR)
+        run: |
+          terraform -chdir="$TF_DIR" init -input=false \
+            -backend-config="bucket=${TF_STATE_BUCKET}" \
+            -backend-config="key=preview/pr-${PR_NUMBER}/terraform.tfstate" \
+            -backend-config="region=${AWS_REGION}"
+
+      - name: terraform plan
+        run: |
+          set -euo pipefail
+          TF_VAR_created_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          export TF_VAR_created_at
+          terraform -chdir="$TF_DIR" plan -input=false -no-color -out=tfplan | tee plan.txt
+          {
+            echo "### Terraform plan (PR #${PR_NUMBER})"
+            echo '```'
+            grep -E '^(Plan:|No changes)' plan.txt || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: terraform apply (espera a que la tarea esté HEALTHY)
+        run: terraform -chdir="$TF_DIR" apply -input=false -auto-approve tfplan
+
+      - name: Endpoint del entorno y costo estimado
+        id: endpoint
+        run: bash scripts/preview-endpoint.sh
+
+  # ---------------------------------------------------------------------------
+  integration:
+    name: "5 · Pruebas de integración"
+    needs: [build, infra]
+    if: ${{ always() && needs.build.result == 'success' && contains(fromJSON('["success","skipped"]'), needs.infra.result) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write # acceso just-in-time al security group
+    env:
+      AWS_URL: ${{ needs.infra.outputs.url }}
+      SG_ID: ${{ needs.infra.outputs.security_group_id }}
+      IMAGE_REF: ${{ needs.build.outputs.image }}@${{ needs.build.outputs.digest }}
+    steps:
+      - name: Checkout del commit del PR
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Credenciales temporales de AWS (OIDC)
+        if: ${{ needs.infra.outputs.url != '' }}
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          role-session-name: gha-pr-${{ github.event.pull_request.number }}-it
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Abrir acceso just-in-time (/32 de este runner)
+        if: ${{ needs.infra.outputs.url != '' }}
+        uses: ./.github/actions/jit-access
+        with:
+          security-group-id: ${{ needs.infra.outputs.security_group_id }}
+          mode: open
+
+      - name: Objetivo de las pruebas
+        run: bash scripts/preview-target.sh
+
+      - name: Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      - name: Pruebas de integración contra el entorno desplegado
+        working-directory: app
+        run: npm run test:integration
+
+      - name: Revocar acceso just-in-time
+        if: ${{ always() && needs.infra.outputs.url != '' }}
+        uses: ./.github/actions/jit-access
+        with:
+          security-group-id: ${{ needs.infra.outputs.security_group_id }}
+          mode: close
+
+  # ---------------------------------------------------------------------------
+  dast:
+    name: "6 · DAST (OWASP ZAP full scan)"
+    needs: [build, infra, integration]
+    if: ${{ always() && needs.integration.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write # acceso just-in-time al security group
+    env:
+      AWS_URL: ${{ needs.infra.outputs.url }}
+      SG_ID: ${{ needs.infra.outputs.security_group_id }}
+      IMAGE_REF: ${{ needs.build.outputs.image }}@${{ needs.build.outputs.digest }}
+    steps:
+      - name: Checkout del commit del PR
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Credenciales temporales de AWS (OIDC)
+        if: ${{ needs.infra.outputs.url != '' }}
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          role-session-name: gha-pr-${{ github.event.pull_request.number }}-dast
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Abrir acceso just-in-time (/32 de este runner)
+        if: ${{ needs.infra.outputs.url != '' }}
+        uses: ./.github/actions/jit-access
+        with:
+          security-group-id: ${{ needs.infra.outputs.security_group_id }}
+          mode: open
+
+      - name: Objetivo del escaneo
+        run: bash scripts/preview-target.sh
+
+      # Full scan = spider + escaneo ACTIVO (ataques reales). Seguro de ejecutar porque el
+      # entorno es desechable y aislado: nunca se haría contra producción.
+      - name: OWASP ZAP full scan
+        uses: zaproxy/action-full-scan@3c58388149901b9a03b7718852c5ba889646c27c # v0.13.0
+        with:
+          target: ${{ env.BASE_URL }}
+          docker_name: ghcr.io/zaproxy/zaproxy:stable@sha256:9624669db72f54d86c4b46a7064518bd9bf79d8c61a4c31befa9923489f328af
+          rules_file_name: .zap/rules.tsv
+          cmd_options: -I
+          allow_issue_writing: false
+          fail_action: true
+          artifact_name: zap-full-scan-pr-${{ github.event.pull_request.number }}
+
+      - name: Revocar acceso just-in-time
+        if: ${{ always() && needs.infra.outputs.url != '' }}
+        uses: ./.github/actions/jit-access
+        with:
+          security-group-id: ${{ needs.infra.outputs.security_group_id }}
+          mode: close
+
+  # ---------------------------------------------------------------------------
+  report:
+    name: "7 · Reporte del PR (seguridad + FinOps)"
+    needs: [gates, build, verify, infra, integration, dast]
+    if: ${{ always() && github.event.action != 'closed' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write # comentario único (sticky) con el estado del PR
+    env:
+      GH_TOKEN: ${{ github.token }}
+      R_GATES: ${{ needs.gates.result }}
+      R_BUILD: ${{ needs.build.result }}
+      R_VERIFY: ${{ needs.verify.result }}
+      R_INFRA: ${{ needs.infra.result }}
+      R_IT: ${{ needs.integration.result }}
+      R_DAST: ${{ needs.dast.result }}
+      IMAGE: ${{ needs.build.outputs.image }}
+      DIGEST: ${{ needs.build.outputs.digest }}
+      URL: ${{ needs.infra.outputs.url }}
+      HOURLY: ${{ needs.infra.outputs.hourly_usd }}
+      MONTHLY: ${{ needs.infra.outputs.monthly_usd }}
+      EXPIRES: ${{ needs.infra.outputs.expires_at }}
+    steps:
+      - name: Publicar o actualizar el reporte en el PR
+        run: |
+          set -euo pipefail
+          icon() { case "$1" in success) echo "✅";; failure) echo "❌";; skipped) echo "⏭️";; cancelled) echo "🚫";; *) echo "•";; esac; }
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          marker="<!-- preview-report -->"
+          if [ -n "$URL" ]; then
+            env_line="**Entorno efímero en AWS:** \`${URL}\` (acceso just-in-time desde el pipeline)"
+            finops="| Costo estimado | US\$ ${HOURLY}/h · si se olvidara: US\$ ${MONTHLY}/mes |
+          | Expira (janitor) | ${EXPIRES} |
+          | Destrucción | automática al hacer merge o cerrar este PR |"
+          else
+            env_line="**Entorno AWS no configurado:** las pruebas de integración y el DAST se ejecutaron contra el contenedor local."
+            finops="| Costo | US\$ 0 (sin infraestructura en la nube) |"
+          fi
+          body="${marker}
+          ## Pipeline DevSecOps + FinOps · commit \`${HEAD_SHA:0:7}\`
+
+          | # | Etapa | Resultado |
+          |---|---|---|
+          | 1 | Security gates (Gitleaks, Semgrep, SonarQube, tests, Checkov) | $(icon "$R_GATES") ${R_GATES} |
+          | 2 | Build + Trivy + SBOM + attestations | $(icon "$R_BUILD") ${R_BUILD} |
+          | 3 | Validación del artefacto | $(icon "$R_VERIFY") ${R_VERIFY} |
+          | 4 | Terraform apply (AWS efímero) | $(icon "$R_INFRA") ${R_INFRA} |
+          | 5 | Pruebas de integración | $(icon "$R_IT") ${R_IT} |
+          | 6 | DAST OWASP ZAP | $(icon "$R_DAST") ${R_DAST} |
+
+          ${env_line}
+
+          | FinOps | |
+          |---|---|
+          ${finops}
+
+          Imagen: \`${IMAGE:-n/a}@${DIGEST:-n/a}\` · [Ver ejecución](${run_url})"
+          id="$(gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" --paginate \
+                --jq ".[] | select(.body | startswith(\"${marker}\")) | .id" | head -n1)"
+          if [ -n "$id" ]; then
+            gh api -X PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${id}" -f body="$body" >/dev/null
+          else
+            gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" -f body="$body" >/dev/null
+          fi
+
+  # ---------------------------------------------------------------------------
+  destroy:
+    name: "8 · Terraform destroy (merge o cierre)"
+    if: ${{ github.event.action == 'closed' && vars.AWS_ROLE_ARN != '' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      id-token: write # OIDC -> rol temporal de AWS
+      pull-requests: write # comentario final con el costo del entorno
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+      MERGED: ${{ github.event.pull_request.merged }}
+      # destroy no usa estos valores, pero Terraform exige variables válidas.
+      TF_VAR_pr_number: ${{ github.event.pull_request.number }}
+      TF_VAR_image: ghcr.io/destroy/placeholder@sha256:0000000000000000000000000000000000000000000000000000000000000000
+      TF_VAR_execution_role_arn: ${{ vars.ECS_EXECUTION_ROLE_ARN }}
+      TF_VAR_commit_sha: ${{ github.event.pull_request.head.sha }}
+      TF_VAR_owner: ${{ github.event.pull_request.user.login }}
+      TF_VAR_region: ${{ vars.AWS_REGION || 'us-east-1' }}
+    steps:
+      - name: Checkout de la rama base (el código de infraestructura vigente)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+
+      - name: Credenciales temporales de AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          role-session-name: gha-pr-${{ github.event.pull_request.number }}-destroy
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: terraform destroy + eliminación del estado
+        run: bash scripts/preview-destroy.sh "$PR_NUMBER"
+
+      - name: Comentario final en el PR (vida y costo del entorno)
+        if: ${{ always() }}
+        run: |
+          [ -f destroy-report.md ] || exit 0
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" -F body=@destroy-report.md >/dev/null
+
+  # ---------------------------------------------------------------------------
+  cleanup:
+    name: "9 · Limpieza de imágenes del PR"
+    if: ${{ github.event.action == 'closed' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      packages: write # borrar las versiones de imagen de este PR
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Borrar imágenes pr-<N>-* de GHCR
+        run: |
+          set -euo pipefail
+          owner="${GITHUB_REPOSITORY_OWNER}"
+          pkg="${IMAGE_NAME}"
+          ids="$(gh api "/users/${owner}/packages/container/${pkg}/versions" --paginate \
+                  --jq ".[] | select(any(.metadata.container.tags[]?; startswith(\"pr-${PR_NUMBER}-\"))) | .id" || true)"
+          count=0
+          for id in $ids; do
+            gh api -X DELETE "/users/${owner}/packages/container/${pkg}/versions/${id}" && count=$((count + 1)) || true
+          done
+          echo "### Limpieza: ${count} versión(es) de imagen del PR #${PR_NUMBER} eliminadas" >> "$GITHUB_STEP_SUMMARY"
