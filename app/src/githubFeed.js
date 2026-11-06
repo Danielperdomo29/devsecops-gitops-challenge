@@ -89,6 +89,9 @@ export function createGithubFeed({
       id: run.id,
       title: String(run.display_title ?? ''),
       pr: run.pull_requests?.[0]?.number ?? null,
+      // GitHub deja de informar el número de PR cuando la rama se borra tras el merge:
+      // la rama de origen sirve de respaldo para identificar la ejecución.
+      branch: /^[\w./-]{1,100}$/.test(run.head_branch ?? '') ? run.head_branch : '',
       sha: /^[0-9a-f]{40}$/.test(run.head_sha) ? run.head_sha : '',
       status: run.status,
       conclusion: run.conclusion,

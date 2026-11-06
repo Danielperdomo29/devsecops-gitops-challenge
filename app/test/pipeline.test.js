@@ -173,6 +173,7 @@ describe('githubFeed: carga, caché y degradación', () => {
     const snap = await feed.snapshot();
     assert.equal(snap.preview[0].url, null);
     assert.equal(snap.preview[0].sha, '');
+    assert.equal(snap.preview[0].branch, '');
     assert.equal(auth, 'Bearer t0k3n');
   });
 });
@@ -223,6 +224,29 @@ describe('pipelineView', () => {
     assert.ok(html.includes('1 min 35 s'));
     assert.ok(html.includes('hace 5 s'));
     assert.ok(html.includes('http-equiv="refresh"'));
+  });
+
+  it('sin número de PR (rama borrada tras el merge) muestra la rama de origen', () => {
+    const base = {
+      title: 't',
+      sha: SHA,
+      kind: 'cierre',
+      status: 'completed',
+      conclusion: 'success',
+    };
+    const stages = Array(9).fill('skip');
+    const snapshot = {
+      fetchedAt: 0,
+      stale: false,
+      deploy: [],
+      preview: [
+        { ...base, pr: null, branch: 'feat/demo', url: null, durationSec: 1, stages },
+        { ...base, pr: null, branch: '', url: null, durationSec: 1, stages },
+      ],
+    };
+    const html = renderPipeline(info, { feedEnabled: true, snapshot, nowMs: 0 });
+    assert.ok(html.includes('PR <code>feat/demo</code>'));
+    assert.ok(html.includes('<strong>PR</strong>'));
   });
 
   it('muestra aviso cuando GitHub no responde y listas vacías', () => {
