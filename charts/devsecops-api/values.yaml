@@ -1,0 +1,118 @@
+# =============================================================================
+# values.yaml — valores POR DEFECTO del chart (contrato de parametrización)
+# -----------------------------------------------------------------------------
+# - Cada entorno aplica encima su propio values.override.yaml
+#   (gitops/environments/<entorno>/values.override.yaml): el último archivo gana.
+# - El bloque "image" lo actualiza AUTOMÁTICAMENTE el pipeline
+#   (.github/workflows/deploy.yaml, job gitops-promote) con un commit en Git.
+#   ArgoCD detecta ese commit y sincroniza el clúster: Git es la fuente de la verdad.
+# - values.schema.json valida tipos y formatos: un error de tipeo en un override
+#   falla en CI (helm lint), no en producción.
+# =============================================================================
+
+replicaCount: 2
+image:
+  # Registro OCI donde el pipeline publica la imagen.
+  repository: ghcr.io/danielperdomo29/devsecops-api
+  # Tag = SHA completo del commit que originó la imagen (trazabilidad commit -> imagen -> pod).
+  tag: ""
+  # Digest inmutable sha256 de esa misma imagen. Si está presente, el pod usa repo:tag@digest:
+  # aunque alguien re-etiquete el tag en el registro, el clúster ejecuta exactamente lo escaneado.
+  digest: ""
+  # Always: con digest fijo no hay coste extra y obliga a autenticarse contra el registro
+  # en cada arranque (evita reutilizar imágenes privadas cacheadas en el nodo).
+  pullPolicy: Always
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+# Aplicación (variables de entorno no sensibles).
+env:
+  appEnv: default
+  logLevel: info
+  # Margen tras SIGTERM para que el Service retire el pod antes de cerrar conexiones.
+  shutdownDelayMs: 5000
+# Seguridad a nivel de pod (cumple Pod Security Standards "restricted").
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+# Seguridad a nivel de contenedor.
+securityContext:
+  allowPrivilegeEscalation: false
+  privileged: false
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  capabilities:
+    drop: ["ALL"]
+# OpenShift: la SCC restricted-v2 asigna un UID aleatorio del rango del namespace.
+# Con enabled=true el chart NO fija runAsUser/runAsGroup/fsGroup y puede crear una Route.
+openshift:
+  enabled: false
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8080
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  host: ""
+  tls: []
+route:
+  enabled: false
+  host: ""
+  annotations: {}
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 250m
+    memory: 128Mi
+probes:
+  startup:
+    path: /healthz
+    periodSeconds: 2
+    failureThreshold: 15
+  liveness:
+    path: /healthz
+    periodSeconds: 10
+    timeoutSeconds: 2
+    failureThreshold: 3
+  readiness:
+    path: /readyz
+    periodSeconds: 5
+    timeoutSeconds: 2
+    failureThreshold: 2
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 5
+  targetCPUUtilizationPercentage: 70
+# Solo se crea si hay más de una réplica posible: un PDB con minAvailable=1 sobre
+# una única réplica bloquearía los drenados de nodo (kubectl drain) indefinidamente.
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+# Zero-trust de red: se deniega todo el egress (la app no hace llamadas salientes)
+# y solo se admite ingreso al puerto de la app desde los orígenes indicados.
+networkPolicy:
+  enabled: true
+  # Vacío = cualquier origen hacia el puerto http. En prod se restringe al Ingress/Router.
+  ingressFrom: []
+# Reparte réplicas entre nodos para tolerar la caída de uno.
+topologySpread:
+  enabled: true
+  maxSkew: 1
+  topologyKey: kubernetes.io/hostname
+nodeSelector: {}
+tolerations: []
+affinity: {}
+podAnnotations: {}

@@ -1,0 +1,16 @@
+apiVersion: v2
+name: devsecops-api
+description: Chart endurecido para la API DevSecOps (Kubernetes y OpenShift), desplegado por ArgoCD.
+type: application
+# Versión del CHART (empaquetado). Se versiona por separado de la aplicación.
+version: 1.0.0
+# Versión de la APLICACIÓN. La imagen concreta la fija image.tag/image.digest en values.yaml.
+appVersion: "1.0.0"
+kubeVersion: ">=1.27.0-0"
+keywords: [devsecops, gitops, argocd, openshift]
+home: https://github.com/Danielperdomo29/devsecops-gitops-challenge
+sources:
+  - https://github.com/Danielperdomo29/devsecops-gitops-challenge
+maintainers:
+  - name: Daniel Enrique Perdomo Carvajal
+    url: https://github.com/Danielperdomo29

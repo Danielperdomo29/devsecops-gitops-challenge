@@ -1,0 +1,123 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "devsecops-api values",
+  "description": "Contrato de valores: helm lint/template fallan si un override no lo cumple.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["image", "resources", "podSecurityContext", "securityContext"],
+  "properties": {
+    "global": { "type": "object" },
+    "replicaCount": { "type": "integer", "minimum": 1, "maximum": 20 },
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "pullPolicy"],
+      "properties": {
+        "repository": { "type": "string", "pattern": "^[a-z0-9.-]+(:[0-9]+)?/[a-z0-9._/-]+$" },
+        "tag": {
+          "type": "string",
+          "description": "SHA completo del commit (40 hex) o versión semántica.",
+          "pattern": "^$|^[0-9a-f]{40}$|^[0-9]+\\.[0-9]+\\.[0-9]+([-.][0-9A-Za-z.-]+)?$"
+        },
+        "digest": { "type": "string", "pattern": "^$|^sha256:[a-f0-9]{64}$" },
+        "pullPolicy": { "enum": ["Always", "IfNotPresent", "Never"] }
+      }
+    },
+    "imagePullSecrets": {
+      "type": "array",
+      "items": { "type": "object", "required": ["name"], "properties": { "name": { "type": "string" } } }
+    },
+    "nameOverride": { "type": "string" },
+    "fullnameOverride": { "type": "string" },
+    "serviceAccount": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "create": { "type": "boolean" },
+        "name": { "type": "string" },
+        "annotations": { "type": "object" }
+      }
+    },
+    "env": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "appEnv": { "enum": ["default", "dev", "staging", "prod"] },
+        "logLevel": { "enum": ["debug", "info", "warn", "error"] },
+        "shutdownDelayMs": { "type": "integer", "minimum": 0, "maximum": 60000 }
+      }
+    },
+    "podSecurityContext": {
+      "type": "object",
+      "required": ["runAsNonRoot", "seccompProfile"],
+      "properties": {
+        "runAsNonRoot": { "const": true }
+      }
+    },
+    "securityContext": {
+      "type": "object",
+      "required": ["allowPrivilegeEscalation", "readOnlyRootFilesystem", "capabilities"],
+      "properties": {
+        "allowPrivilegeEscalation": { "const": false },
+        "privileged": { "const": false },
+        "readOnlyRootFilesystem": { "const": true }
+      }
+    },
+    "openshift": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": { "enabled": { "type": "boolean" } }
+    },
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": { "enum": ["ClusterIP", "NodePort", "LoadBalancer"] },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "targetPort": { "type": "integer", "minimum": 1, "maximum": 65535 }
+      }
+    },
+    "ingress": { "type": "object" },
+    "route": { "type": "object" },
+    "resources": {
+      "type": "object",
+      "required": ["requests", "limits"],
+      "properties": {
+        "requests": { "type": "object", "required": ["cpu", "memory"] },
+        "limits": { "type": "object", "required": ["memory"] }
+      }
+    },
+    "probes": { "type": "object" },
+    "autoscaling": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "minReplicas": { "type": "integer", "minimum": 1 },
+        "maxReplicas": { "type": "integer", "minimum": 1 },
+        "targetCPUUtilizationPercentage": { "type": "integer", "minimum": 1, "maximum": 100 }
+      }
+    },
+    "podDisruptionBudget": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "minAvailable": { "type": ["integer", "string"] }
+      }
+    },
+    "networkPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "ingressFrom": { "type": "array" }
+      }
+    },
+    "topologySpread": { "type": "object" },
+    "nodeSelector": { "type": "object" },
+    "tolerations": { "type": "array" },
+    "affinity": { "type": "object" },
+    "podAnnotations": { "type": "object" }
+  }
+}

@@ -1,0 +1,12 @@
+devsecops-api desplegado en el namespace {{ .Release.Namespace }}.
+
+Imagen: {{ include "devsecops-api.image" . }}
+
+Probar localmente:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "devsecops-api.fullname" . }} 8080:{{ .Values.service.port }}
+  curl -s http://localhost:8080/version
+{{- if .Values.route.enabled }}
+
+Route de OpenShift:
+  oc -n {{ .Release.Namespace }} get route {{ include "devsecops-api.fullname" . }}
+{{- end }}

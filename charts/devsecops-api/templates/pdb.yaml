@@ -1,0 +1,14 @@
+{{- if and .Values.podDisruptionBudget.enabled (include "devsecops-api.multiReplica" .) -}}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "devsecops-api.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "devsecops-api.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "devsecops-api.selectorLabels" . | nindent 6 }}
+{{- end }}

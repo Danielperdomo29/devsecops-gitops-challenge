@@ -1,0 +1,27 @@
+{{- if .Values.networkPolicy.enabled -}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "devsecops-api.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "devsecops-api.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "devsecops-api.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - ports:
+        - port: http
+          protocol: TCP
+      {{- with .Values.networkPolicy.ingressFrom }}
+      from:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  # Sin reglas de egress = egress denegado: la API no necesita conexiones salientes.
+  # Si en el futuro consume una BD, se añade aquí una regla explícita y mínima.
+  egress: []
+{{- end }}
