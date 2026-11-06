@@ -1,0 +1,6 @@
+# Contexto de build mínimo: solo lo que la imagen necesita (evita filtrar secretos o .git).
+*
+!package.json
+!package-lock.json
+!.npmrc
+!src/**
