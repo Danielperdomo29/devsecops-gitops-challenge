@@ -1,0 +1,25 @@
+{
+  "name": "devsecops-api",
+  "version": "1.0.0",
+  "description": "API mínima e instrumentada para demostrar un flujo DevSecOps + GitOps: GitHub Actions -> GHCR -> Helm -> ArgoCD.",
+  "author": "Daniel Enrique Perdomo Carvajal",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "main": "src/index.js",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "lint": "biome check .",
+    "format": "biome check --write .",
+    "test": "node --test --experimental-test-coverage --test-coverage-lines=90 --test-coverage-branches=80 --test-coverage-functions=90 --test-coverage-exclude=src/index.js --test-coverage-exclude=src/healthcheck.js --test-coverage-exclude=test/** \"test/**/*.test.js\"",
+    "test:lcov": "node --test --experimental-test-coverage --test-coverage-exclude=src/index.js --test-coverage-exclude=src/healthcheck.js --test-coverage-exclude=test/** --test-reporter=spec --test-reporter-destination=stdout --test-reporter=lcov --test-reporter-destination=lcov.info \"test/**/*.test.js\"",
+    "test:integration": "node --test \"test-integration/**/*.test.js\""
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.6.4"
+  }
+}
