@@ -81,13 +81,18 @@ function runLink(run, text) {
   return run.url ? `<a href="${e(run.url)}" rel="noopener noreferrer">${e(text)}</a>` : e(text);
 }
 
+function prLabel(run) {
+  if (run.pr) return `PR #${e(run.pr)}`;
+  return run.branch ? `PR <code>${e(run.branch)}</code>` : 'PR';
+}
+
 function previewRows(runs) {
   if (runs.length === 0) return '<p class="muted">Aún no hay ejecuciones de Pull Requests.</p>';
   return runs
     .map(
       (run) => `<div class="run">
 <div class="run-head">
-<strong>${run.pr ? `PR #${e(run.pr)}` : 'PR'}</strong> ${e(run.title)}
+<strong>${prLabel(run)}</strong> ${e(run.title)}
 <span class="muted">· ${e(run.kind)} · <code>${e(run.sha.slice(0, 7) || 'n/a')}</code> · ${duration(run.durationSec)}</span>
 ${runBadge(run)} ${runLink(run, 'ver ejecución')}
 </div>

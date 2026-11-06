@@ -18,6 +18,10 @@ locals {
   partition    = data.aws_partition.current.partition
   state_bucket = "${var.project}-tfstate-${local.account_id}"
   oidc_url     = "token.actions.githubusercontent.com"
+  repo_owner   = split("/", var.github_repository)[0]
+  repo_name    = split("/", var.github_repository)[1]
+  # Prefijo del subject inmutable de GitHub: nombres + IDs numéricos.
+  oidc_subject = "repo:${local.repo_owner}@${var.github_owner_id}/${local.repo_name}@${var.github_repository_id}"
   oidc_arn     = var.create_oidc_provider ? aws_iam_openid_connect_provider.github[0].arn : data.aws_iam_openid_connect_provider.github[0].arn
   log_prefix   = "/ecs/devsecops-pr-"
 }
@@ -245,7 +249,7 @@ data "aws_iam_policy_document" "github_trust" {
       variable = "${local.oidc_url}:aud"
       values   = ["sts.amazonaws.com"]
     }
-    # Claim "sub" permitido (coincidencia exacta, sin comodines):
+    # Claim "sub" permitido (subject inmutable con IDs, coincidencia exacta, sin comodines):
     #  - environment:preview  -> job de despliegue (muestra la URL en el PR)
     #  - pull_request         -> pruebas, DAST y destroy de PRs de ESTE repo
     #                            (los PRs desde forks no reciben token OIDC)
@@ -254,9 +258,9 @@ data "aws_iam_policy_document" "github_trust" {
       test     = "StringEquals"
       variable = "${local.oidc_url}:sub"
       values = [
-        "repo:${var.github_repository}:environment:${var.github_environment}",
-        "repo:${var.github_repository}:pull_request",
-        "repo:${var.github_repository}:ref:refs/heads/main",
+        "${local.oidc_subject}:environment:${var.github_environment}",
+        "${local.oidc_subject}:pull_request",
+        "${local.oidc_subject}:ref:refs/heads/main",
       ]
     }
   }
@@ -308,6 +312,8 @@ data "aws_iam_policy_document" "github_preview" {
       "ecs:RegisterTaskDefinition", "ecs:DeregisterTaskDefinition", "ecs:DescribeTaskDefinition",
       "ecs:DeleteTaskDefinitions", "ecs:CreateService", "ecs:UpdateService", "ecs:DeleteService",
       "ecs:DescribeServices", "ecs:ListTasks", "ecs:DescribeTasks",
+      # Lectura de despliegues: la usa el waiter de AWS provider 6.x (wait_for_steady_state).
+      "ecs:ListServiceDeployments", "ecs:DescribeServiceDeployments", "ecs:DescribeServiceRevisions",
       "ecs:TagResource", "ecs:UntagResource", "ecs:ListTagsForResource",
       "logs:CreateLogGroup", "logs:DeleteLogGroup", "logs:DescribeLogGroups", "logs:PutRetentionPolicy",
       "logs:TagResource", "logs:UntagResource", "logs:ListTagsForResource", "logs:TagLogGroup",
