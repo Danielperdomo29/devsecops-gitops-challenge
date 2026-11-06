@@ -1,0 +1,35 @@
+# =============================================================================
+# Render Blueprint (infraestructura como código para la demo pública y el tablero)
+# https://render.com/docs/blueprint-spec
+# -----------------------------------------------------------------------------
+# - Construye la MISMA imagen (app/Dockerfile) que el pipeline publica en GHCR.
+# - autoDeployTrigger: off -> Render NO despliega por su cuenta. Lo dispara el job
+#   render-deploy de deploy.yaml con un Deploy Hook (?ref=<sha>) SOLO después de que
+#   el commit pasó todos los gates, el build, el commit GitOps y la verificación con
+#   ArgoCD; luego el mismo job comprueba que /version sirve ese SHA.
+#   (Lección aprendida: con checksPass, el commit GitOps del bot -sin checks y fuera
+#   de buildFilter- quedaba como último commit y Render no desplegaba el código nuevo.)
+# - PIPELINE_FEED=github activa /pipeline con datos en vivo de GitHub Actions. En
+#   Kubernetes queda desactivado: allí la NetworkPolicy deniega todo el egress.
+# =============================================================================
+services:
+  - type: web
+    name: devsecops-gitops-challenge
+    runtime: docker
+    plan: free
+    region: oregon
+    branch: main
+    dockerfilePath: ./app/Dockerfile
+    dockerContext: ./app
+    healthCheckPath: /healthz
+    autoDeployTrigger: "off"
+    envVars:
+      - key: APP_ENV
+        value: render
+      - key: LOG_LEVEL
+        value: info
+      - key: PIPELINE_FEED
+        value: github
+      # Opcional: token de solo lectura para ampliar la cuota de la API de GitHub.
+      - key: GITHUB_FEED_TOKEN
+        sync: false
