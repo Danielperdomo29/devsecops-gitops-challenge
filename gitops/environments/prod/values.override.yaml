@@ -1,0 +1,46 @@
+# =============================================================================
+# Override de PRODUCCIÓN (OpenShift)
+# Se aplica DESPUÉS de charts/devsecops-api/values.yaml (el último archivo gana).
+# - Alta disponibilidad: HPA 3-10 réplicas y PDB minAvailable=2.
+# - OpenShift: Route con TLS edge y UID asignado por la SCC restricted-v2.
+# - Red: solo el Router de OpenShift puede llegar a los pods.
+# - Imagen: producción NO sigue automáticamente a dev. La promoción la hace
+#   .github/workflows/promote-prod.yaml, que verifica la procedencia SLSA de la
+#   imagen y abre un Pull Request que fija image.tag e image.digest en este archivo.
+#   Aprobar ese PR (four-eyes) es la "puerta" a producción.
+# =============================================================================
+openshift:
+  enabled: true
+
+route:
+  enabled: true
+  host: devsecops-api.apps.example.com
+
+autoscaling:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 65
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 2
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+env:
+  appEnv: prod
+  logLevel: info
+
+networkPolicy:
+  enabled: true
+  ingressFrom:
+    - namespaceSelector:
+        matchLabels:
+          policy-group.network.openshift.io/ingress: ""

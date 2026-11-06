@@ -1,0 +1,61 @@
+# =============================================================================
+# AppProject: frontera de seguridad (least privilege) para las Applications.
+# Aunque alguien modifique una Application, ArgoCD solo permitirá:
+#   - leer ESTE repositorio,
+#   - desplegar en ESTOS namespaces del clúster local,
+#   - crear ESTOS tipos de recurso (nada de ClusterRoles, CRDs, Secrets...).
+# =============================================================================
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: devsecops
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  description: API DevSecOps (prueba técnica) - proyecto aislado
+  sourceRepos:
+    - https://github.com/Danielperdomo29/devsecops-gitops-challenge.git
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: devsecops-dev
+    - server: https://kubernetes.default.svc
+      namespace: devsecops-prod
+  # Único recurso de clúster permitido: el Namespace (CreateNamespace=true).
+  clusterResourceWhitelist:
+    - group: ""
+      kind: Namespace
+  namespaceResourceWhitelist:
+    - group: apps
+      kind: Deployment
+    - group: ""
+      kind: Service
+    - group: ""
+      kind: ServiceAccount
+    - group: autoscaling
+      kind: HorizontalPodAutoscaler
+    - group: policy
+      kind: PodDisruptionBudget
+    - group: networking.k8s.io
+      kind: NetworkPolicy
+    - group: networking.k8s.io
+      kind: Ingress
+    - group: route.openshift.io
+      kind: Route
+  # Avisa de recursos en el namespace que no están en Git (posible drift manual).
+  orphanedResources:
+    warn: true
+  # Congelamiento nocturno de producción: no se sincroniza automáticamente de 22:00 a 06:00 UTC.
+  syncWindows:
+    - kind: deny
+      schedule: "0 22 * * *"
+      duration: 8h
+      applications:
+        - devsecops-api-prod
+      manualSync: true
+      timeZone: UTC
+  roles:
+    - name: read-only
+      description: Acceso de solo lectura para auditoría
+      policies:
+        - p, proj:devsecops:read-only, applications, get, devsecops/*, allow

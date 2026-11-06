@@ -1,0 +1,23 @@
+# =============================================================================
+# Override de DESARROLLO
+# Se aplica DESPUÉS de charts/devsecops-api/values.yaml (el último archivo gana).
+# Solo declara lo que difiere del default: menos réplicas, menos recursos, logs debug.
+# La imagen NO se fija aquí: dev siempre sigue la última imagen que el pipeline
+# promueve en values.yaml (entrega continua).
+# =============================================================================
+replicaCount: 1
+
+autoscaling:
+  enabled: false
+
+resources:
+  requests:
+    cpu: 25m
+    memory: 48Mi
+  limits:
+    cpu: 200m
+    memory: 96Mi
+
+env:
+  appEnv: dev
+  logLevel: debug

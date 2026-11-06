@@ -1,0 +1,68 @@
+# =============================================================================
+# ArgoCD Application — entorno DEV (entregable del ejercicio práctico)
+# -----------------------------------------------------------------------------
+# Flujo GitOps:
+#   1. El pipeline publica la imagen <sha> y hace commit en
+#      charts/devsecops-api/values.yaml (image.tag + image.digest).
+#   2. ArgoCD detecta el commit (polling cada 3 min o webhook de GitHub),
+#      renderiza el chart con Helm y compara el resultado con el clúster.
+#   3. syncPolicy.automated aplica la diferencia; selfHeal revierte cualquier
+#      cambio manual (drift) y prune elimina lo que ya no está en Git.
+# El pipeline NUNCA recibe credenciales del clúster: ArgoCD hace "pull" desde dentro.
+# =============================================================================
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: devsecops-api-dev
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: devsecops-gitops-challenge
+    environment: dev
+  # Al borrar la Application se borran en cascada sus recursos del clúster.
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: devsecops
+
+  source:
+    repoURL: https://github.com/Danielperdomo29/devsecops-gitops-challenge.git
+    targetRevision: main               # rama que ArgoCD observa
+    path: charts/devsecops-api         # ruta del chart dentro del repo
+    helm:
+      releaseName: devsecops-api
+      # Orden = precedencia: el último archivo sobrescribe a los anteriores.
+      valueFiles:
+        - values.yaml
+        - ../../gitops/environments/dev/values.override.yaml
+      # Si un archivo de values no existe, fallar (no desplegar algo inesperado).
+      ignoreMissingValueFiles: false
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: devsecops-dev
+
+  syncPolicy:
+    automated:
+      prune: true        # elimina del clúster lo que se borró de Git
+      selfHeal: true     # revierte cambios manuales (kubectl edit/scale) al estado de Git
+      allowEmpty: false  # nunca sincroniza un render vacío (protege ante errores de ruta)
+    syncOptions:
+      - CreateNamespace=true
+      - PruneLast=true            # borra recursos obsoletos al final, tras crear los nuevos
+      - ServerSideApply=true
+      - ApplyOutOfSyncOnly=true   # aplica solo lo que cambió (clústeres grandes)
+    # El namespace nace con Pod Security Admission "restricted": el clúster rechaza
+    # cualquier pod que no cumpla el perfil más estricto de Kubernetes.
+    managedNamespaceMetadata:
+      labels:
+        pod-security.kubernetes.io/enforce: restricted
+        pod-security.kubernetes.io/audit: restricted
+        pod-security.kubernetes.io/warn: restricted
+    retry:
+      limit: 5
+      backoff:
+        duration: 10s
+        factor: 2
+        maxDuration: 3m
+
+  revisionHistoryLimit: 10

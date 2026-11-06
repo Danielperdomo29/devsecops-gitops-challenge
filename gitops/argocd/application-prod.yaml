@@ -1,0 +1,51 @@
+# =============================================================================
+# ArgoCD Application — entorno PROD (OpenShift)
+# Diferencias con dev:
+#   - values.override.yaml de prod (HA, Route, red restringida, imagen fijada por PR).
+#   - Sujeta a la ventana de congelamiento nocturno definida en el AppProject.
+#   - selfHeal activo: en producción NADIE cambia el clúster a mano; todo pasa por PR.
+# =============================================================================
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: devsecops-api-prod
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: devsecops-gitops-challenge
+    environment: prod
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: devsecops
+  source:
+    repoURL: https://github.com/Danielperdomo29/devsecops-gitops-challenge.git
+    targetRevision: main
+    path: charts/devsecops-api
+    helm:
+      releaseName: devsecops-api
+      valueFiles:
+        - values.yaml
+        - ../../gitops/environments/prod/values.override.yaml
+      ignoreMissingValueFiles: false
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: devsecops-prod
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+      allowEmpty: false
+    syncOptions:
+      - CreateNamespace=true
+      - PruneLast=true
+      - ServerSideApply=true
+    managedNamespaceMetadata:
+      labels:
+        pod-security.kubernetes.io/enforce: restricted
+    retry:
+      limit: 5
+      backoff:
+        duration: 10s
+        factor: 2
+        maxDuration: 3m
+  revisionHistoryLimit: 20
