@@ -312,6 +312,8 @@ data "aws_iam_policy_document" "github_preview" {
       "ecs:RegisterTaskDefinition", "ecs:DeregisterTaskDefinition", "ecs:DescribeTaskDefinition",
       "ecs:DeleteTaskDefinitions", "ecs:CreateService", "ecs:UpdateService", "ecs:DeleteService",
       "ecs:DescribeServices", "ecs:ListTasks", "ecs:DescribeTasks",
+      # Lectura de despliegues: la usa el waiter de AWS provider 6.x (wait_for_steady_state).
+      "ecs:ListServiceDeployments", "ecs:DescribeServiceDeployments", "ecs:DescribeServiceRevisions",
       "ecs:TagResource", "ecs:UntagResource", "ecs:ListTagsForResource",
       "logs:CreateLogGroup", "logs:DeleteLogGroup", "logs:DescribeLogGroups", "logs:PutRetentionPolicy",
       "logs:TagResource", "logs:UntagResource", "logs:ListTagsForResource", "logs:TagLogGroup",
