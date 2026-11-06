@@ -28,15 +28,19 @@ fi
 
 echo "==> Cuenta: $(aws sts get-caller-identity --query Account --output text)"
 
-# ¿Ya existe el proveedor OIDC de GitHub en la cuenta? (solo puede haber uno)
+terraform init -input=false
+
+# Proveedor OIDC de GitHub (solo puede haber uno por cuenta):
+#  - si ya lo gestiona ESTE estado (re-ejecución), se mantiene gestionado;
+#  - si existe pero lo creó otro proceso, se reutiliza como data source.
 create_oidc=true
-if aws iam list-open-id-connect-providers --query 'OpenIDConnectProviderList[].Arn' --output text \
+if terraform state list 2>/dev/null | grep -qF 'aws_iam_openid_connect_provider.github[0]'; then
+  echo "==> Proveedor OIDC gestionado por este estado: se mantiene"
+elif aws iam list-open-id-connect-providers --query 'OpenIDConnectProviderList[].Arn' --output text \
    | grep -q 'token.actions.githubusercontent.com'; then
   create_oidc=false
   echo "==> Proveedor OIDC de GitHub ya existe: se reutiliza"
 fi
-
-terraform init -input=false
 terraform apply -input=false \
   -var "budget_emails=[\"${EMAIL}\"]" \
   -var "create_oidc_provider=${create_oidc}"

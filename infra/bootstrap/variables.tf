@@ -16,6 +16,21 @@ variable "github_repository" {
   default     = "Danielperdomo29/devsecops-gitops-challenge"
 }
 
+# GitHub emite "subject inmutable" (repo:OWNER@OWNER_ID/REPO@REPO_ID:...): un repositorio
+# borrado y recreado con el MISMO nombre tiene otro ID y no hereda la confianza (repo-jacking).
+# IDs: gh api users/<owner> --jq .id  ·  gh api repos/<owner>/<repo> --jq .id
+variable "github_owner_id" {
+  description = "ID numérico inmutable del dueño del repositorio."
+  type        = number
+  default     = 144385717
+}
+
+variable "github_repository_id" {
+  description = "ID numérico inmutable del repositorio."
+  type        = number
+  default     = 1447922203
+}
+
 variable "github_environment" {
   description = "GitHub Environment desde el que se permite asumir el rol (claim 'sub' del token OIDC)."
   type        = string
