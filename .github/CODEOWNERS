@@ -1,0 +1,4 @@
+# Revisores obligatorios cuando se active la protección de rama.
+*                                   @Danielperdomo29
+/.github/                           @Danielperdomo29
+/gitops/environments/prod/          @Danielperdomo29

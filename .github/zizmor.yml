@@ -1,0 +1,10 @@
+# Configuración de zizmor (auditoría de seguridad de GitHub Actions).
+rules:
+  # self-repository recomienda `uses: $/...` (GitHub, julio 2026) en lugar de `./...`.
+  # Se mantiene `./` porque actionlint 1.7.12 aún no reconoce la nueva sintaxis y es un gate
+  # bloqueante. Riesgo evaluado: en eventos pull_request el workflow también proviene del PR,
+  # así que `$/` no protege frente a un autor con escritura; la defensa real es que los PRs
+  # de forks no reciben token OIDC y el rol de AWS solo confía en este repositorio.
+  # Revisar al actualizar actionlint (Dependabot).
+  self-repository:
+    disable: true
