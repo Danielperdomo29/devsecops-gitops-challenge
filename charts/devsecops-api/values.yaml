@@ -15,10 +15,10 @@ image:
   # Registro OCI donde el pipeline publica la imagen.
   repository: ghcr.io/danielperdomo29/devsecops-api
   # Tag = SHA completo del commit que originó la imagen (trazabilidad commit -> imagen -> pod).
-  tag: ""
+  tag: "ebdaaf873ccedbc13cb7889d4d3f687c0ab79f15"
   # Digest inmutable sha256 de esa misma imagen. Si está presente, el pod usa repo:tag@digest:
   # aunque alguien re-etiquete el tag en el registro, el clúster ejecuta exactamente lo escaneado.
-  digest: ""
+  digest: "sha256:352280ad4d0da1cc775594620922cba28b6b64f5eafb3dc2aacefa1145133e27"
   # Always: con digest fijo no hay coste extra y obliga a autenticarse contra el registro
   # en cada arranque (evita reutilizar imágenes privadas cacheadas en el nodo).
   pullPolicy: Always
