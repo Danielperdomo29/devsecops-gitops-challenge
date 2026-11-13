@@ -20,6 +20,6 @@
     "test:integration": "node --test \"test-integration/**/*.test.js\""
   },
   "devDependencies": {
-    "@biomejs/biome": "2.6.4"
+    "@biomejs/biome": "2.6.5"
   }
 }
